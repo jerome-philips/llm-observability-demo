@@ -62,8 +62,8 @@ isn't enough.
 ## Closing the loop: an evaluation layer that writes back to the trace
 
 Finding this manually in Discover proves the failure mode exists, but
-doesn't scale — nobody reviews every trace by hand. `evaluation/evaluator.py`
-runs two checks on every agent turn, automatically:
+doesn't scale — nobody reviews every trace by hand. The first version of
+`evaluation/evaluator.py` ran two checks on every agent turn, automatically:
 
 1. **Cost-anomaly detection**: flags a turn whose total token usage
    crosses a fixed threshold. Cheap, deterministic, no extra API call.
@@ -95,6 +95,69 @@ trace content required. It closes the gap the dashboard alone left open.
 
 ![Discover view filtered on evaluation.flagged: true, across the five example runs](assets/anomaly-view.png)
 
+## What the evaluation itself costs — and fixing the root cause
+
+The judge is a model call too, so it needs the same scrutiny as the agent.
+Its call was already wrapped in a `chat` span, but it was indistinguishable
+from the agent's own `chat` spans: both used the same model, so
+`gen_ai.request.model` couldn't tell them apart. Tagging every `chat` span
+with `llm.call.purpose` (`agent` or `evaluation`) and splitting the cost
+panel on it made the problem obvious. On the demo's five example queries,
+the dashboard showed about 5,100 evaluation tokens for 6,800 agent
+tokens: judging every answer added three quarters to the cost of
+producing it. Untagged, the judge's spans had also been blending into the
+latency panel and adding a forced `tool_use` to the finish-reason
+breakdown on every turn.
+
+Two options were considered and rejected. Forcing the agent to always call
+a tool (with an extra "escalate to a human" tool for anything out of
+scope) would remove the failure mode structurally, but would also block
+legitimate answers that need no tool — asking a customer for their order
+ID, for one. Warning the end user that an answer might be hallucinated
+would fire on those same legitimate answers and erode trust in every
+reply; a flag is for the team operating the agent, not for its users.
+
+The fix that shipped has two parts:
+
+1. **A free rule gating the judge.** This agent's only source of facts is
+   its order-lookup tool, so an answer produced without any tool call is
+   the only kind with nothing grounding it. That check costs nothing — the
+   agent already knows whether it called a tool — and the judge now runs
+   only on those turns, where it separates a fabricated answer from a
+   legitimate one (a greeting, a request for an order ID). Whether the
+   judge ran is recorded as `evaluation.judge_called` on the
+   `invoke_agent` span.
+2. **Fixing the root cause in the system prompt.** The agent is now told
+   it has no information about store policies, returns, refunds or
+   products, and must say so rather than answer from general knowledge.
+
+Re-running the same five queries, the return-policy question (trace
+`7bd998425e5f190380eea1729e2d9d15`) now gets:
+
+> "I can't answer questions about return policies. Please contact a human
+> agent for information about returns, refunds, and store policies.
+> They'll be able to help you with all the details you need."
+
+The four order-lookup turns went through the tool and skipped the judge
+entirely; the return-policy turn was the only one sent to it, and it
+cleared the answer. Evaluation cost dropped to about 1,000 tokens for
+7,300 agent tokens — from three quarters of the agent's cost to about a
+seventh. The agent's own tokens went up slightly (6,800 to 7,300), since
+the longer system prompt is sent on every call, but the total per run
+still fell from about 11,900 tokens to about 8,300, roughly 30% less.
+
+![Token usage split by llm.call.purpose: the first run judges every turn, the second only the turn made without a tool call](assets/evaluation-cost.png)
+
+The trade-off is explicit: a hallucination added *after* a tool call
+(say, an invented refund policy appended to a real order lookup) no longer
+goes to the judge. A production setup would cover that by judging a
+sample of tool-backed turns rather than none of them.
+
+This is the full loop the project set out to show: a failure invisible to
+metrics, caught in the trace content, flagged automatically, fixed at the
+source — and the fix, including what it costs to keep checking for it,
+verified in the same traces and dashboard.
+
 ## Takeaways
 
 - Standard APM concepts (spans, traces, dashboards) carry over cleanly to
@@ -108,6 +171,10 @@ trace content required. It closes the gap the dashboard alone left open.
   trace it judges — a separate eval report nobody cross-references with
   live traces doesn't change what an on-call engineer sees during an
   incident.
+- The evaluation layer has a cost of its own, and it belongs in the same
+  dashboards. Once it was measured, a free deterministic rule cut it from
+  three quarters of the agent's token spend to about a seventh, by
+  reserving the paid judge for the only turns that needed it.
 
 ## Appendix: a real debugging example
 

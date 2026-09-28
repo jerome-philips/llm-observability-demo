@@ -19,10 +19,14 @@ app/main.py  --calls-->  app/agent.py::run_agent()
    |
    +--> chat span (2nd call, with tool result folded in)
    |
-   +--> evaluation/evaluator.py::evaluate()  (cost threshold + LLM-as-judge)
-   |        the judge call is itself a chat span; the combined verdict is
-   |        written back onto the invoke_agent span as evaluation.flagged /
-   |        evaluation.reasons before returning
+   +--> evaluation/evaluator.py::evaluate()  (cost threshold, then LLM-as-judge
+   |        only if the turn made no tool call)
+   |        the judge call is itself a chat span, tagged
+   |        llm.call.purpose = "evaluation" (the agent's own chat spans carry
+   |        "agent"), so its tokens are counted but can be split out from the
+   |        agent's; the combined verdict is written back onto the
+   |        invoke_agent span as evaluation.flagged / evaluation.reasons
+   |        before returning
    |
    v
 Final answer returned to caller
@@ -48,8 +52,9 @@ LLM-based system.
 
 A cost or latency dashboard has no way to catch a confidently wrong
 answer — a hallucinated response isn't slower or more expensive to
-produce than a correct one. `evaluation/evaluator.py` runs an LLM-as-judge
-check (plus a cheap token-count threshold) on every turn and attaches the
+produce than a correct one. `evaluation/evaluator.py` runs a cheap token-count
+threshold on every turn, plus an LLM-as-judge check on turns where the
+agent answered without calling its tool, and attaches the
 verdict directly to that turn's `invoke_agent` span. That keeps the
 flagged answer next to the full trace that produced it, instead of living
 in a disconnected offline report.

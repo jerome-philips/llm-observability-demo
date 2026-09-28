@@ -3,27 +3,41 @@ Evaluation layer: what differentiates "AI observability" from generic
 APM. Traditional monitoring won't catch a runaway token cost or a
 confidently wrong answer — this module is where that gets caught.
 
-Two checks run on every agent turn:
+Three checks, from cheapest to most expensive:
 
-1. Cost-anomaly detection: flag a turn whose total token usage exceeds a
-   fixed threshold. Cheap, deterministic, no extra API call. A production
-   version would compare against a rolling average/stddev per
-   agent/tool combination rather than a fixed number — a threshold is
-   enough to demonstrate the mechanism here.
+1. Cost-anomaly detection (every turn): flag a turn whose total token
+   usage exceeds a fixed threshold. Cheap, deterministic, no extra API
+   call. A production version would compare against a rolling
+   average/stddev per agent/tool combination rather than a fixed number
+   — a threshold is enough to demonstrate the mechanism here.
 
-2. LLM-as-judge quality check: send the user's question and the agent's
-   answer to a model with a rubric prompt, asking it to flag answers that
-   look fabricated rather than grounded in what this agent can actually
-   know (it can only look up order status through a tool — it has no
-   real return-policy documents and no general knowledge about this
-   store). This is the check that catches a confidently wrong answer a
-   cost or latency dashboard would never flag, since a hallucinated
-   answer isn't slower or more expensive to produce than a correct one.
+2. No-tool-call rule (every turn): this agent's only source of facts is
+   its order-lookup tool, so an answer produced without any tool call has
+   nothing grounding it. Free and deterministic, but noisy on its own: a
+   greeting, or asking the customer for their order ID, is also a
+   legitimate answer without a tool call. So this rule doesn't flag by
+   itself — it decides whether the judge runs.
+
+3. LLM-as-judge quality check (only on turns the rule picked out): send
+   the user's question and the agent's answer to a model with a rubric
+   prompt, asking it to flag answers that look fabricated rather than
+   grounded in what this agent can actually know. This is the check that
+   catches a confidently wrong answer a cost or latency dashboard would
+   never flag — and it also clears the rule's false positives.
+
+   Running the judge on every turn used to cost roughly three quarters of the
+   agent's own tokens on top of every answer, visible in Kibana once the
+   judge's chat span was tagged `llm.call.purpose = "evaluation"`. Gating
+   it behind the free rule keeps it off the turns that went through the
+   tool. Trade-off: a hallucination added *after* a tool call (e.g. an
+   invented delivery date on top of a real lookup) is no longer judged. A
+   production setup would cover that with sampled judging of tool-backed
+   turns.
 
 The combined result is written back onto the current `invoke_agent` span
-as `evaluation.flagged` / `evaluation.reasons`, so a flagged turn is
-visible in Kibana right next to the trace it's about, rather than living
-in an offline report disconnected from the trace data.
+as `evaluation.flagged` / `evaluation.reasons`, plus
+`evaluation.judge_called`, so a flagged turn is visible in Kibana right
+next to the trace it's about, and the judge's call rate can be tracked.
 """
 
 from __future__ import annotations
@@ -79,6 +93,7 @@ SUBMIT_EVALUATION_SCHEMA = {
 class EvaluationResult:
     flagged: bool
     reasons: list[str] = field(default_factory=list)
+    judge_called: bool = False
 
 
 def _check_cost_anomaly(token_usage: dict) -> EvaluationResult:
@@ -99,14 +114,20 @@ def _check_llm_judge(user_message: str, agent_answer: str) -> EvaluationResult:
     judge_messages = [
         {
             "role": "user",
-            "content": f"User question:\n{user_message}\n\nAgent answer:\n{agent_answer}",
+            "content": (
+                f"User question:\n{user_message}\n\n"
+                f"Agent answer (produced without any tool call):\n{agent_answer}"
+            ),
         }
     ]
 
     # The judge call is itself a model call, so it gets its own chat span —
-    # it shows up as a sibling of the agent's own chat spans, distinguished
-    # by gen_ai.request.model, rather than as an untraced side effect.
-    with chat_span(model=EVAL_MODEL) as span:
+    # it shows up as a sibling of the agent's own chat spans rather than as
+    # an untraced side effect, and its tokens count toward the run's cost.
+    # purpose="evaluation" is what tells it apart from the agent's calls:
+    # EVAL_MODEL and the agent's model can be the same, so
+    # gen_ai.request.model isn't enough on its own.
+    with chat_span(model=EVAL_MODEL, purpose="evaluation") as span:
         response = client.messages.create(
             model=EVAL_MODEL,
             max_tokens=256,
@@ -122,12 +143,27 @@ def _check_llm_judge(user_message: str, agent_answer: str) -> EvaluationResult:
     return EvaluationResult(flagged=verdict["flagged"], reasons=verdict["reasons"])
 
 
-def evaluate(user_message: str, agent_answer: str, token_usage: dict) -> EvaluationResult:
-    """Run both checks and combine their verdicts."""
+def evaluate(
+    user_message: str, agent_answer: str, token_usage: dict, tool_called: bool
+) -> EvaluationResult:
+    """Run the cost check, then the judge only if no tool was called."""
     cost_result = _check_cost_anomaly(token_usage)
-    judge_result = _check_llm_judge(user_message, agent_answer)
 
+    if tool_called:
+        return EvaluationResult(
+            flagged=cost_result.flagged,
+            reasons=cost_result.reasons,
+            judge_called=False,
+        )
+
+    judge_result = _check_llm_judge(user_message, agent_answer)
+    judge_reasons = (
+        ["answer produced without any tool call"] + judge_result.reasons
+        if judge_result.flagged
+        else []
+    )
     return EvaluationResult(
         flagged=cost_result.flagged or judge_result.flagged,
-        reasons=cost_result.reasons + judge_result.reasons,
+        reasons=cost_result.reasons + judge_reasons,
+        judge_called=True,
     )

@@ -48,12 +48,15 @@ modules are the actual core of what it sets out to prove:
   (`gen_ai.usage.total_tokens`, `gen_ai.tool.output`). This is what makes
   the traces show up correctly in Kibana. See the module docstring for the
   full attribute list.
-- `evaluation/evaluator.py` — a cost-anomaly check (fixed token threshold)
-  and an LLM-as-judge quality check (a second model call, forced into
-  structured output, reviewing the agent's answer for fabricated claims).
-  The combined verdict is written back onto the `invoke_agent` span as
-  `evaluation.flagged` / `evaluation.reasons`, so a flagged turn is visible
-  right next to the trace that produced it.
+- `evaluation/evaluator.py` — a cost-anomaly check (fixed token threshold),
+  a free "no tool call" rule, and an LLM-as-judge quality check (a second
+  model call, forced into structured output, reviewing the agent's answer
+  for fabricated claims). The judge only runs on turns where the agent
+  answered without calling its tool — the only turns where it has nothing
+  to ground its answer — which keeps its cost off every other turn. The
+  combined verdict is written back onto the `invoke_agent` span as
+  `evaluation.flagged` / `evaluation.reasons` / `evaluation.judge_called`,
+  so a flagged turn is visible right next to the trace that produced it.
 
 ## Setup
 
@@ -132,16 +135,27 @@ where `otel-collector-config.yaml` routes them), build:
 
 1. **Cost over time**: a line/bar visualization summing
    `gen_ai.usage.input_tokens` + `gen_ai.usage.output_tokens` (multiplied
-   by your model's price per token) bucketed by time.
+   by your model's price per token) bucketed by time, split by
+   `llm.call.purpose` so the evaluator's own cost (`evaluation`) shows up
+   separately from the agent's (`agent`) instead of silently inflating it.
 2. **Latency per call type**: span duration, split by span name
-   (`chat` vs `execute_tool`).
+   (`chat` vs `execute_tool`), filtered on
+   `NOT llm.call.purpose : "evaluation"`. (Not `llm.call.purpose : "agent"`:
+   only `chat` spans carry the attribute, so that filter would also drop
+   every `execute_tool` span.)
 3. **Finish reason breakdown**: a pie/bar on `gen_ai.response.finish_reasons`
-   to spot truncations or tool-call loops.
+   to spot truncations or tool-call loops, filtered on
+   `NOT llm.call.purpose : "evaluation"` — the judge is forced into a tool
+   call, so every judge span reports `tool_use` and would skew the split
+   otherwise.
 4. **Trace explorer**: Kibana's APM/trace view, filtered to your service
    name, to walk `invoke_agent -> chat -> execute_tool` per request.
 5. **Anomaly view**: a saved search filtered on `evaluation.flagged: true`
    (set by `evaluator.py` on the `invoke_agent` span), so a flagged trace
    surfaces right next to the run it belongs to.
+6. **Judge call rate** (optional): share of `invoke_agent` spans with
+   `evaluation.judge_called: true` — how often the free rule escalates to
+   the paid judge.
 
 Export these as saved objects once built (`Stack Management > Saved
 Objects > Export`) and commit the export into `kibana/dashboards/`.
@@ -167,4 +181,5 @@ Sources: [OpenTelemetry Blog — Inside the LLM Call: GenAI Observability with O
 - [x] Run against local Elastic stack, confirm traces appear in Kibana
 - [x] Build the dashboards above, export as saved objects
 - [x] Implement `evaluation/evaluator.py` (cost anomaly and LLM-as-judge)
+- [x] Tag the judge's own model call and gate it behind a free "no tool call" rule to cut evaluation cost
 - [x] Write up the case study (`docs/case-study.md`)

@@ -22,7 +22,12 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
 
 SYSTEM_PROMPT = (
     "You are a customer support assistant. Use the get_order_status tool "
-    "whenever the user asks about a specific order. Keep answers short."
+    "whenever the user asks about a specific order. If they ask about an "
+    "order without giving its ID, ask them for it. You have no information "
+    "about store policies, returns, refunds or products: for any question "
+    "that isn't about an order's status, say you can't answer it and "
+    "suggest contacting a human agent — never answer it from general "
+    "knowledge. Keep answers short."
 )
 
 
@@ -32,14 +37,17 @@ def _add_usage(totals: dict, response) -> None:
     totals["total_tokens"] += response.usage.input_tokens + response.usage.output_tokens
 
 
-def _finalize(top_span, user_message: str, answer: str, run_tokens: dict) -> str:
+def _finalize(
+    top_span, user_message: str, answer: str, run_tokens: dict, tool_called: bool
+) -> str:
     """Run the evaluator on the finished answer and attach its verdict to
     the invoke_agent span, so a flagged turn is visible right next to the
     trace it's about.
     """
-    evaluation = evaluate(user_message, answer, run_tokens)
+    evaluation = evaluate(user_message, answer, run_tokens, tool_called)
     top_span.set_attribute("evaluation.flagged", evaluation.flagged)
     top_span.set_attribute("evaluation.reasons", evaluation.reasons)
+    top_span.set_attribute("evaluation.judge_called", evaluation.judge_called)
     return answer
 
 
@@ -74,7 +82,7 @@ def run_agent(user_message: str) -> str:
         if not tool_use_blocks:
             text_blocks = [b.text for b in response.content if b.type == "text"]
             answer = "\n".join(text_blocks)
-            return _finalize(top_span, user_message, answer, run_tokens)
+            return _finalize(top_span, user_message, answer, run_tokens, tool_called=False)
 
         # Execute each requested tool call and feed results back.
         messages.append({"role": "assistant", "content": response.content})
@@ -106,4 +114,4 @@ def run_agent(user_message: str) -> str:
 
         text_blocks = [b.text for b in final_response.content if b.type == "text"]
         answer = "\n".join(text_blocks)
-        return _finalize(top_span, user_message, answer, run_tokens)
+        return _finalize(top_span, user_message, answer, run_tokens, tool_called=True)

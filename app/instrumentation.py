@@ -30,6 +30,7 @@ correctly in any tool built around this convention):
 
   On `chat` spans:
     gen_ai.request.model            e.g. "claude-sonnet-4-5"
+    llm.call.purpose                # Pas standard - Ajout custom: "agent" or "evaluation"
     gen_ai.usage.input_tokens       from response.usage.input_tokens
     gen_ai.usage.output_tokens      from response.usage.output_tokens
     gen_ai.usage.total_tokens       # Pas standard - Ajout custom
@@ -96,9 +97,17 @@ def agent_span(agent_name: str) -> Iterator[Optional[Any]]:
 
 
 @contextmanager
-def chat_span(model: str) -> Iterator[Optional[Any]]:
+def chat_span(model: str, purpose: str = "agent") -> Iterator[Optional[Any]]:
+    """`purpose` separates the agent's own model calls from the evaluator's
+    LLM-as-judge call. Both are `chat` spans under the same `invoke_agent`,
+    and both can use the same model, so gen_ai.request.model alone can't
+    tell them apart — without this, the judge's tokens, latency and forced
+    `tool_use` finish reason get blended into the agent's numbers.
+    """
     with tracer.start_as_current_span("chat") as span:
         span.set_attribute("gen_ai.request.model", model)
+        # Pas standard - Ajout custom
+        span.set_attribute("llm.call.purpose", purpose)
         yield span
 
 
